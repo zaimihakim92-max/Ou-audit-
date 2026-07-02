@@ -291,7 +291,7 @@ $script:dataTable = New-Object System.Data.DataTable
 $grpSearch = New-Object System.Windows.Forms.GroupBox
 $grpSearch.Text     = "1. Recherche des comptes de service"
 $grpSearch.Location = New-Object System.Drawing.Point(10, 10)
-$grpSearch.Size     = New-Object System.Drawing.Size(1145, 90)
+$grpSearch.Size     = New-Object System.Drawing.Size(1145, 105)
 
 $lblOu = New-Object System.Windows.Forms.Label
 $lblOu.Text = "OU (DN, optionnel) :"
@@ -301,7 +301,14 @@ $lblOu.Size = New-Object System.Drawing.Size(120, 20)
 $txtOu = New-Object System.Windows.Forms.TextBox
 $txtOu.Location = New-Object System.Drawing.Point(135, 22)
 $txtOu.Size = New-Object System.Drawing.Size(400, 20)
-$txtOu.PlaceholderText = "Ex : OU=ComptesService,DC=domaine,DC=local"
+# Note : PlaceholderText n'existe pas sur un TextBox WinForms .NET Framework classique
+# (propriété disponible uniquement en WPF/UWP) -> utilisation d'un Label d'aide à la place.
+$lblOuHint = New-Object System.Windows.Forms.Label
+$lblOuHint.Text = "(ex : OU=ComptesService,DC=domaine,DC=local)"
+$lblOuHint.Location = New-Object System.Drawing.Point(135, 44)
+$lblOuHint.Size = New-Object System.Drawing.Size(400, 15)
+$lblOuHint.ForeColor = [System.Drawing.Color]::Gray
+$lblOuHint.Font = New-Object System.Drawing.Font("Segoe UI", 7, [System.Drawing.FontStyle]::Italic)
 
 $lblPattern = New-Object System.Windows.Forms.Label
 $lblPattern.Text = "Motif de nom :"
@@ -321,26 +328,26 @@ $btnLoad.BackColor = [System.Drawing.Color]::LightSteelBlue
 
 $chkAltCred = New-Object System.Windows.Forms.CheckBox
 $chkAltCred.Text = "Utiliser des identifiants alternatifs"
-$chkAltCred.Location = New-Object System.Drawing.Point(10, 55)
+$chkAltCred.Location = New-Object System.Drawing.Point(10, 70)
 $chkAltCred.Size = New-Object System.Drawing.Size(220, 20)
 
 $chkSimulation = New-Object System.Windows.Forms.CheckBox
 $chkSimulation.Text = "Mode SIMULATION (aucune écriture AD)"
-$chkSimulation.Location = New-Object System.Drawing.Point(260, 55)
+$chkSimulation.Location = New-Object System.Drawing.Point(260, 70)
 $chkSimulation.Size = New-Object System.Drawing.Size(280, 20)
 $chkSimulation.Checked = $true
 $chkSimulation.ForeColor = [System.Drawing.Color]::DarkOrange
 $script:chkSimulation = $chkSimulation
 
-$grpSearch.Controls.AddRange(@($lblOu,$txtOu,$lblPattern,$txtPattern,$btnLoad,$chkAltCred,$chkSimulation))
+$grpSearch.Controls.AddRange([System.Windows.Forms.Control[]]@($lblOu,$txtOu,$lblOuHint,$lblPattern,$txtPattern,$btnLoad,$chkAltCred,$chkSimulation))
 
 # ================================================================================================
 # --- GROUPE 2 : Barres de recherche (compte / groupe cible) -------------------------------------
 # ================================================================================================
 $grpFilters = New-Object System.Windows.Forms.GroupBox
 $grpFilters.Text = "2. Recherche compte affiché / Sélection du groupe cible"
-$grpFilters.Location = New-Object System.Drawing.Point(10, 105)
-$grpFilters.Size = New-Object System.Drawing.Size(1145, 90)
+$grpFilters.Location = New-Object System.Drawing.Point(10, 120)
+$grpFilters.Size = New-Object System.Drawing.Size(1145, 100)
 
 $lblSearchAccount = New-Object System.Windows.Forms.Label
 $lblSearchAccount.Text = "Rechercher un compte :"
@@ -350,7 +357,13 @@ $lblSearchAccount.Size = New-Object System.Drawing.Size(130, 20)
 $txtSearchAccount = New-Object System.Windows.Forms.TextBox
 $txtSearchAccount.Location = New-Object System.Drawing.Point(145, 22)
 $txtSearchAccount.Size = New-Object System.Drawing.Size(250, 20)
-$txtSearchAccount.PlaceholderText = "Filtrer la liste affichée..."
+# Note : PlaceholderText non supporté par TextBox WinForms .NET Framework -> label d'aide sous le champ
+$lblSearchHint = New-Object System.Windows.Forms.Label
+$lblSearchHint.Text = "(filtre en direct sur la liste affichée)"
+$lblSearchHint.Location = New-Object System.Drawing.Point(145, 44)
+$lblSearchHint.Size = New-Object System.Drawing.Size(250, 15)
+$lblSearchHint.ForeColor = [System.Drawing.Color]::Gray
+$lblSearchHint.Font = New-Object System.Drawing.Font("Segoe UI", 7, [System.Drawing.FontStyle]::Italic)
 
 $lblGroupSearch = New-Object System.Windows.Forms.Label
 $lblGroupSearch.Text = "Rechercher un groupe :"
@@ -367,25 +380,25 @@ $btnGroupSearch.Location = New-Object System.Drawing.Point(785, 20)
 $btnGroupSearch.Size = New-Object System.Drawing.Size(90, 24)
 
 $cmbGroupResults = New-Object System.Windows.Forms.ComboBox
-$cmbGroupResults.Location = New-Object System.Drawing.Point(10, 55)
+$cmbGroupResults.Location = New-Object System.Drawing.Point(10, 68)
 $cmbGroupResults.Size = New-Object System.Drawing.Size(500, 22)
 $cmbGroupResults.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
 
 $lblGroupSelected = New-Object System.Windows.Forms.Label
 $lblGroupSelected.Text = "Aucun groupe sélectionné"
-$lblGroupSelected.Location = New-Object System.Drawing.Point(520, 58)
+$lblGroupSelected.Location = New-Object System.Drawing.Point(520, 71)
 $lblGroupSelected.Size = New-Object System.Drawing.Size(600, 20)
 $lblGroupSelected.ForeColor = [System.Drawing.Color]::DarkRed
 $lblGroupSelected.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
 
-$grpFilters.Controls.AddRange(@($lblSearchAccount,$txtSearchAccount,$lblGroupSearch,$txtGroupSearch,$btnGroupSearch,$cmbGroupResults,$lblGroupSelected))
+$grpFilters.Controls.AddRange([System.Windows.Forms.Control[]]@($lblSearchAccount,$txtSearchAccount,$lblSearchHint,$lblGroupSearch,$txtGroupSearch,$btnGroupSearch,$cmbGroupResults,$lblGroupSelected))
 
 # ================================================================================================
 # --- GROUPE 3 : Grille de résultats --------------------------------------------------------------
 # ================================================================================================
 $dgv = New-Object System.Windows.Forms.DataGridView
-$dgv.Location = New-Object System.Drawing.Point(10, 205)
-$dgv.Size = New-Object System.Drawing.Size(1145, 430)
+$dgv.Location = New-Object System.Drawing.Point(10, 230)
+$dgv.Size = New-Object System.Drawing.Size(1145, 405)
 $dgv.Anchor = "Top,Bottom,Left,Right"
 $dgv.AutoGenerateColumns = $false
 $dgv.AllowUserToAddRows = $false
@@ -432,7 +445,7 @@ $colAction.HeaderText = "Action effectuée"
 $colAction.ReadOnly = $true
 $colAction.FillWeight = 15
 
-$dgv.Columns.AddRange(@($colSelect,$colSam,$colDisplay,$colEnabled,$colStatut,$colAction))
+$dgv.Columns.AddRange([System.Windows.Forms.DataGridViewColumn[]]@($colSelect,$colSam,$colDisplay,$colEnabled,$colStatut,$colAction))
 
 # ================================================================================================
 # --- GROUPE 4 : Boutons d'action -----------------------------------------------------------------
@@ -479,7 +492,7 @@ $progressBar.Location = New-Object System.Drawing.Point(910, 8)
 $progressBar.Size = New-Object System.Drawing.Size(235, 22)
 $progressBar.Style = "Continuous"
 
-$pnlActions.Controls.AddRange(@($btnCheckAll,$btnUncheckAll,$btnCheckNonMembers,$btnAnalyze,$btnFix,$btnExport,$progressBar))
+$pnlActions.Controls.AddRange([System.Windows.Forms.Control[]]@($btnCheckAll,$btnUncheckAll,$btnCheckNonMembers,$btnAnalyze,$btnFix,$btnExport,$progressBar))
 
 # ================================================================================================
 # --- GROUPE 5 : Zone de journal (log) ------------------------------------------------------------
@@ -494,7 +507,7 @@ $txtLog.Font = New-Object System.Drawing.Font("Consolas", 8)
 $script:txtLog = $txtLog
 
 # --- Ajout de tous les contrôles au formulaire ---------------------------------------------------
-$form.Controls.AddRange(@($grpSearch,$grpFilters,$dgv,$pnlActions,$txtLog))
+$form.Controls.AddRange([System.Windows.Forms.Control[]]@($grpSearch,$grpFilters,$dgv,$pnlActions,$txtLog))
 
 # ================================================================================================
 # REGION 4 : MISE EN FORME CONDITIONNELLE DE LA GRILLE (VERT / ROUGE)
