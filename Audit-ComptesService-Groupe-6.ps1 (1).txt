@@ -1,0 +1,550 @@
+#Requires -Version 5.1
+#Requires -Modules ActiveDirectory
+
+<#
+================================================================================================
+  SCRIPT   : Audit-ComptesService-Groupe.ps1
+  OBJECTIF :
+      Outil graphique (WinForms) simple :
+        1. Charge tous les utilisateurs d'une OU (Active Directory)
+        2. Compare directement leur appartenance à un groupe AD cible
+             -> VERT  = membre du groupe
+             -> ROUGE = NON membre du groupe
+        3. Sélection multiple (cases à cocher)
+        4. Bouton FIX : ajoute au groupe les comptes sélectionnés et non-membres
+        5. Export CSV du résultat
+
+  SECURITE :
+      - Mode SIMULATION activé par défaut (aucune écriture AD tant qu'il n'est pas décoché)
+      - Confirmation obligatoire avant toute modification réelle (Add-ADGroupMember)
+      - Entrées utilisateur assainies avant construction des filtres AD
+      - Journalisation complète (fichier log + zone de log dans l'IHM)
+      - Support d'identifiants alternatifs (Get-Credential)
+      - Aucune ressource externe : uniquement le module ActiveDirectory local (RSAT)
+================================================================================================
+#>
+
+# ================================================================================================
+# REGION 0 : INITIALISATION
+# ================================================================================================
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+}
+catch {
+    [System.Windows.Forms.MessageBox]::Show(
+        "Le module ActiveDirectory est introuvable sur ce poste.`nInstalle les RSAT (Remote Server Administration Tools) puis relance le script.",
+        "Module manquant", "OK", "Error"
+    ) | Out-Null
+    exit 1
+}
+
+$script:LogFolder = Join-Path $env:USERPROFILE "Documents\Audit-ComptesService\Logs"
+$script:CsvFolder = Join-Path $env:USERPROFILE "Documents\Audit-ComptesService\Export"
+foreach ($folder in @($script:LogFolder, $script:CsvFolder)) {
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+}
+$script:LogFile = Join-Path $script:LogFolder ("Audit_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+
+$script:Credential      = $null
+$script:TargetGroupDN   = $null
+$script:TargetGroupName = $null
+
+# ================================================================================================
+# REGION 1 : FONCTIONS UTILITAIRES
+# ================================================================================================
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet("INFO","WARN","ERROR","ACTION")][string]$Level = "INFO"
+    )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[{0}] [{1}] {2}" -f $timestamp, $Level, $Message
+    Add-Content -Path $script:LogFile -Value $line -Encoding UTF8
+
+    if ($null -ne $script:txtLog) {
+        $color = switch ($Level) {
+            "ERROR"  { "Red" }
+            "WARN"   { "DarkOrange" }
+            "ACTION" { "Blue" }
+            default  { "Black" }
+        }
+        $script:txtLog.SelectionStart  = $script:txtLog.TextLength
+        $script:txtLog.SelectionLength = 0
+        $script:txtLog.SelectionColor  = [System.Drawing.Color]::$color
+        $script:txtLog.AppendText("$line`r`n")
+        $script:txtLog.ScrollToCaret()
+    }
+}
+
+function Get-SanitizedInput {
+    # N'autorise que : lettres, chiffres, espace, - _ . * (protection anti-injection de filtre AD)
+    param([string]$InputString)
+    if ([string]::IsNullOrWhiteSpace($InputString)) { return "" }
+    return ($InputString -replace '[^a-zA-Z0-9\séèêàçùû\-_\.\*]', '')
+}
+
+function Get-AdCredentialParams {
+    if ($null -ne $script:Credential) { return @{ Credential = $script:Credential } }
+    return @{}
+}
+
+# ================================================================================================
+# REGION 2 : FONCTIONS METIER
+# ================================================================================================
+
+function Resolve-TargetGroup {
+    <#
+        Résout le groupe cible à partir du nom saisi (SamAccountName, Name ou DN).
+        Retourne l'objet ADGroup ou $null en cas d'échec.
+    #>
+    param([string]$GroupName)
+
+    $clean = Get-SanitizedInput -InputString $GroupName
+    if ([string]::IsNullOrWhiteSpace($clean)) {
+        Write-Log -Level ERROR -Message "Aucun nom de groupe saisi."
+        return $null
+    }
+
+    $adParams = @{ ErrorAction = "Stop" }
+    $adParams += Get-AdCredentialParams
+
+    # 1ère tentative : identité directe (SamAccountName ou DN exact)
+    try {
+        $group = Get-ADGroup -Identity $clean @adParams
+        return $group
+    }
+    catch {
+        # 2ème tentative : recherche par nom exact (filtre en chaîne, sûr car $clean est assaini)
+        try {
+            $group = Get-ADGroup -Filter "Name -eq '$clean'" @adParams | Select-Object -First 1
+            if ($group) { return $group }
+        }
+        catch { }
+    }
+
+    Write-Log -Level ERROR -Message "Groupe introuvable : '$GroupName'"
+    return $null
+}
+
+function Get-OuUsersWithMembership {
+    <#
+        Charge tous les utilisateurs d'une OU avec leur appartenance (MemberOf) déjà résolue.
+    #>
+    param([Parameter(Mandatory)][string]$OuDn)
+
+    $adParams = @{
+        SearchBase  = $OuDn
+        Filter      = "*"
+        Properties  = @("DisplayName","Enabled","MemberOf","DistinguishedName")
+        ErrorAction = "Stop"
+    }
+    $adParams += Get-AdCredentialParams
+
+    Write-Log -Level INFO -Message "Chargement des utilisateurs de l'OU : $OuDn"
+    $users = Get-ADUser @adParams
+    Write-Log -Level INFO -Message "$($users.Count) utilisateur(s) trouvé(s) dans l'OU"
+    return $users
+}
+
+function Add-AccountToTargetGroup {
+    param([string]$SamAccountName)
+
+    if ([string]::IsNullOrWhiteSpace($script:TargetGroupDN)) {
+        throw "Aucun groupe cible résolu."
+    }
+
+    if ($script:chkSimulation.Checked) {
+        Write-Log -Level ACTION -Message "[SIMULATION] Ajout de '$SamAccountName' au groupe '$script:TargetGroupName' (aucune écriture réelle)"
+        return $true
+    }
+
+    $adParams = @{ Identity = $script:TargetGroupDN; Members = $SamAccountName; ErrorAction = "Stop" }
+    $adParams += Get-AdCredentialParams
+
+    try {
+        Add-ADGroupMember @adParams
+        Write-Log -Level ACTION -Message "Compte '$SamAccountName' ajouté au groupe '$script:TargetGroupName'"
+        return $true
+    }
+    catch {
+        Write-Log -Level ERROR -Message "Échec ajout '$SamAccountName' : $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Export-ResultsToCsv {
+    param($DataTable)
+
+    if ($DataTable.Rows.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Aucune donnée à exporter.", "Export CSV", "OK", "Information") | Out-Null
+        return
+    }
+
+    $saveDialog = New-Object System.Windows.Forms.SaveFileDialog
+    $saveDialog.InitialDirectory = $script:CsvFolder
+    $saveDialog.FileName         = "Audit_ComptesService_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date)
+    $saveDialog.Filter           = "Fichier CSV (*.csv)|*.csv"
+
+    if ($saveDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        try {
+            $DataTable | Select-Object SamAccountName, DisplayName, Enabled, Statut, ActionEffectuee, DateAnalyse |
+                Export-Csv -Path $saveDialog.FileName -NoTypeInformation -Encoding UTF8 -Delimiter ";"
+            Write-Log -Level INFO -Message "Export CSV réalisé : $($saveDialog.FileName)"
+            [System.Windows.Forms.MessageBox]::Show("Export terminé :`n$($saveDialog.FileName)", "Export CSV", "OK", "Information") | Out-Null
+        }
+        catch {
+            Write-Log -Level ERROR -Message "Erreur export CSV : $($_.Exception.Message)"
+            [System.Windows.Forms.MessageBox]::Show("Erreur lors de l'export :`n$($_.Exception.Message)", "Erreur", "OK", "Error") | Out-Null
+        }
+    }
+}
+
+# ================================================================================================
+# REGION 3 : INTERFACE GRAPHIQUE
+# ================================================================================================
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text          = "Audit & Remédiation - Comptes AD / Appartenance à un groupe"
+$form.Size          = New-Object System.Drawing.Size(1060, 800)
+$form.StartPosition = "CenterScreen"
+$form.MinimumSize   = New-Object System.Drawing.Size(950, 600)
+$form.Font          = New-Object System.Drawing.Font("Segoe UI", 9)
+
+# --- DataTable de travail ------------------------------------------------------------------------
+$script:dataTable = New-Object System.Data.DataTable
+[void]$script:dataTable.Columns.Add("Select", [bool])
+[void]$script:dataTable.Columns.Add("SamAccountName", [string])
+[void]$script:dataTable.Columns.Add("DisplayName", [string])
+[void]$script:dataTable.Columns.Add("Enabled", [string])
+[void]$script:dataTable.Columns.Add("Statut", [string])
+[void]$script:dataTable.Columns.Add("ActionEffectuee", [string])
+[void]$script:dataTable.Columns.Add("DateAnalyse", [string])
+[void]$script:dataTable.Columns.Add("DN", [string])
+
+# --- GroupBox paramètres --------------------------------------------------------------------------
+$grpParams = New-Object System.Windows.Forms.GroupBox
+$grpParams.Text     = "Paramètres"
+$grpParams.Location = New-Object System.Drawing.Point(10, 10)
+$grpParams.Size     = New-Object System.Drawing.Size(1025, 150)
+
+$lblOu = New-Object System.Windows.Forms.Label
+$lblOu.Text = "OU (DN) :"
+$lblOu.Location = New-Object System.Drawing.Point(10, 25)
+$lblOu.Size = New-Object System.Drawing.Size(90, 20)
+
+$txtOu = New-Object System.Windows.Forms.TextBox
+$txtOu.Location = New-Object System.Drawing.Point(105, 22)
+$txtOu.Size = New-Object System.Drawing.Size(500, 20)
+
+$lblOuHelp = New-Object System.Windows.Forms.Label
+$lblOuHelp.Text = "Exemple : OU=Comptes,DC=domaine,DC=local"
+$lblOuHelp.Location = New-Object System.Drawing.Point(105, 44)
+$lblOuHelp.Size = New-Object System.Drawing.Size(500, 15)
+$lblOuHelp.ForeColor = [System.Drawing.Color]::Gray
+$lblOuHelp.Font = New-Object System.Drawing.Font("Segoe UI", 7, [System.Drawing.FontStyle]::Italic)
+
+$lblGroup = New-Object System.Windows.Forms.Label
+$lblGroup.Text = "Groupe cible :"
+$lblGroup.Location = New-Object System.Drawing.Point(620, 25)
+$lblGroup.Size = New-Object System.Drawing.Size(90, 20)
+
+$txtGroup = New-Object System.Windows.Forms.TextBox
+$txtGroup.Location = New-Object System.Drawing.Point(715, 22)
+$txtGroup.Size = New-Object System.Drawing.Size(295, 20)
+
+$lblGroupHelp = New-Object System.Windows.Forms.Label
+$lblGroupHelp.Text = "Nom exact du groupe (SamAccountName)"
+$lblGroupHelp.Location = New-Object System.Drawing.Point(715, 44)
+$lblGroupHelp.Size = New-Object System.Drawing.Size(295, 15)
+$lblGroupHelp.ForeColor = [System.Drawing.Color]::Gray
+$lblGroupHelp.Font = New-Object System.Drawing.Font("Segoe UI", 7, [System.Drawing.FontStyle]::Italic)
+
+$chkAltCred = New-Object System.Windows.Forms.CheckBox
+$chkAltCred.Text = "Identifiants alternatifs"
+$chkAltCred.Location = New-Object System.Drawing.Point(10, 70)
+$chkAltCred.Size = New-Object System.Drawing.Size(180, 20)
+
+$chkSimulation = New-Object System.Windows.Forms.CheckBox
+$chkSimulation.Text = "Mode SIMULATION (aucune écriture AD)"
+$chkSimulation.Location = New-Object System.Drawing.Point(200, 70)
+$chkSimulation.Size = New-Object System.Drawing.Size(300, 20)
+$chkSimulation.Checked = $true
+$chkSimulation.ForeColor = [System.Drawing.Color]::DarkOrange
+$script:chkSimulation = $chkSimulation
+
+$btnAnalyze = New-Object System.Windows.Forms.Button
+$btnAnalyze.Text = "Charger et comparer"
+$btnAnalyze.Location = New-Object System.Drawing.Point(10, 105)
+$btnAnalyze.Size = New-Object System.Drawing.Size(200, 32)
+$btnAnalyze.BackColor = [System.Drawing.Color]::LightSteelBlue
+$btnAnalyze.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+
+$progressBar = New-Object System.Windows.Forms.ProgressBar
+$progressBar.Location = New-Object System.Drawing.Point(220, 112)
+$progressBar.Size = New-Object System.Drawing.Size(400, 20)
+$progressBar.Style = "Continuous"
+
+$lblFilter = New-Object System.Windows.Forms.Label
+$lblFilter.Text = "Filtrer l'affichage :"
+$lblFilter.Location = New-Object System.Drawing.Point(640, 112)
+$lblFilter.Size = New-Object System.Drawing.Size(110, 20)
+
+$txtFilter = New-Object System.Windows.Forms.TextBox
+$txtFilter.Location = New-Object System.Drawing.Point(750, 110)
+$txtFilter.Size = New-Object System.Drawing.Size(260, 20)
+
+$grpParams.Controls.AddRange([System.Windows.Forms.Control[]]@(
+    $lblOu,$txtOu,$lblOuHelp,$lblGroup,$txtGroup,$lblGroupHelp,
+    $chkAltCred,$chkSimulation,$btnAnalyze,$progressBar,$lblFilter,$txtFilter
+))
+
+# --- Grille de résultats ---------------------------------------------------------------------------
+$dgv = New-Object System.Windows.Forms.DataGridView
+$dgv.Location = New-Object System.Drawing.Point(10, 170)
+$dgv.Size = New-Object System.Drawing.Size(1025, 430)
+$dgv.Anchor = "Top,Bottom,Left,Right"
+$dgv.AutoGenerateColumns = $false
+$dgv.AllowUserToAddRows = $false
+$dgv.AllowUserToDeleteRows = $false
+$dgv.SelectionMode = "FullRowSelect"
+$dgv.RowHeadersVisible = $false
+$dgv.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
+
+$colSelect = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+$colSelect.DataPropertyName = "Select"; $colSelect.HeaderText = "Sélection"; $colSelect.FillWeight = 10
+
+$colSam = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+$colSam.DataPropertyName = "SamAccountName"; $colSam.HeaderText = "SamAccountName"; $colSam.ReadOnly = $true; $colSam.FillWeight = 22
+
+$colDisplay = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+$colDisplay.DataPropertyName = "DisplayName"; $colDisplay.HeaderText = "Nom affiché"; $colDisplay.ReadOnly = $true; $colDisplay.FillWeight = 28
+
+$colEnabled = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+$colEnabled.DataPropertyName = "Enabled"; $colEnabled.HeaderText = "Activé"; $colEnabled.ReadOnly = $true; $colEnabled.FillWeight = 10
+
+$colStatut = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+$colStatut.DataPropertyName = "Statut"; $colStatut.HeaderText = "Statut (appartenance au groupe)"; $colStatut.ReadOnly = $true; $colStatut.FillWeight = 20
+
+$colAction = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+$colAction.DataPropertyName = "ActionEffectuee"; $colAction.HeaderText = "Action effectuée"; $colAction.ReadOnly = $true; $colAction.FillWeight = 15
+
+$dgv.Columns.AddRange([System.Windows.Forms.DataGridViewColumn[]]@($colSelect,$colSam,$colDisplay,$colEnabled,$colStatut,$colAction))
+
+$dgv.Add_CellFormatting({
+    param($sender, $e)
+    if ($dgv.Columns[$e.ColumnIndex].DataPropertyName -eq "Statut") {
+        switch ($e.Value) {
+            "Membre"     { $e.CellStyle.BackColor = [System.Drawing.Color]::LightGreen;  $e.CellStyle.ForeColor = [System.Drawing.Color]::DarkGreen }
+            "Non membre" { $e.CellStyle.BackColor = [System.Drawing.Color]::LightSalmon; $e.CellStyle.ForeColor = [System.Drawing.Color]::DarkRed }
+            default      { $e.CellStyle.BackColor = [System.Drawing.Color]::WhiteSmoke;  $e.CellStyle.ForeColor = [System.Drawing.Color]::Gray }
+        }
+    }
+})
+
+# --- Boutons d'action -------------------------------------------------------------------------------
+$pnlActions = New-Object System.Windows.Forms.Panel
+$pnlActions.Location = New-Object System.Drawing.Point(10, 610)
+$pnlActions.Size = New-Object System.Drawing.Size(1025, 40)
+$pnlActions.Anchor = "Bottom,Left,Right"
+
+$btnCheckAll = New-Object System.Windows.Forms.Button
+$btnCheckAll.Text = "Tout cocher"; $btnCheckAll.Location = New-Object System.Drawing.Point(0, 5); $btnCheckAll.Size = New-Object System.Drawing.Size(110, 28)
+
+$btnUncheckAll = New-Object System.Windows.Forms.Button
+$btnUncheckAll.Text = "Tout décocher"; $btnUncheckAll.Location = New-Object System.Drawing.Point(115, 5); $btnUncheckAll.Size = New-Object System.Drawing.Size(110, 28)
+
+$btnCheckNonMembers = New-Object System.Windows.Forms.Button
+$btnCheckNonMembers.Text = "Cocher les non-membres"; $btnCheckNonMembers.Location = New-Object System.Drawing.Point(230, 5); $btnCheckNonMembers.Size = New-Object System.Drawing.Size(170, 28)
+
+$btnFix = New-Object System.Windows.Forms.Button
+$btnFix.Text = "FIX - Ajouter au groupe"; $btnFix.Location = New-Object System.Drawing.Point(410, 5); $btnFix.Size = New-Object System.Drawing.Size(180, 28); $btnFix.BackColor = [System.Drawing.Color]::LightGreen
+
+$btnExport = New-Object System.Windows.Forms.Button
+$btnExport.Text = "Exporter CSV"; $btnExport.Location = New-Object System.Drawing.Point(600, 5); $btnExport.Size = New-Object System.Drawing.Size(140, 28)
+
+$pnlActions.Controls.AddRange([System.Windows.Forms.Control[]]@($btnCheckAll,$btnUncheckAll,$btnCheckNonMembers,$btnFix,$btnExport))
+
+# --- Zone de journal ---------------------------------------------------------------------------------
+$txtLog = New-Object System.Windows.Forms.RichTextBox
+$txtLog.Location = New-Object System.Drawing.Point(10, 655)
+$txtLog.Size = New-Object System.Drawing.Size(1025, 100)
+$txtLog.Anchor = "Bottom,Left,Right"
+$txtLog.ReadOnly = $true
+$txtLog.Font = New-Object System.Drawing.Font("Consolas", 8)
+$script:txtLog = $txtLog
+
+$form.Controls.AddRange([System.Windows.Forms.Control[]]@($grpParams,$dgv,$pnlActions,$txtLog))
+
+# ================================================================================================
+# REGION 4 : EVENEMENTS
+# ================================================================================================
+
+$chkAltCred.Add_CheckedChanged({
+    if ($chkAltCred.Checked) {
+        $cred = Get-Credential -Message "Identifiants pour les opérations Active Directory"
+        if ($null -ne $cred) {
+            $script:Credential = $cred
+            Write-Log -Level INFO -Message "Identifiants alternatifs définis pour : $($cred.UserName)"
+        }
+        else { $chkAltCred.Checked = $false }
+    }
+    else {
+        $script:Credential = $null
+        Write-Log -Level INFO -Message "Retour au contexte de session courant"
+    }
+})
+
+$txtFilter.Add_TextChanged({
+    $clean = (Get-SanitizedInput -InputString $txtFilter.Text) -replace "'", "''"
+    try {
+        if ([string]::IsNullOrWhiteSpace($clean)) {
+            $script:dataTable.DefaultView.RowFilter = ""
+        }
+        else {
+            $script:dataTable.DefaultView.RowFilter = "SamAccountName LIKE '%$clean%' OR DisplayName LIKE '%$clean%'"
+        }
+    }
+    catch { }
+})
+
+# --- Bouton principal : Charger + comparer en une seule action -----------------------------------
+$btnAnalyze.Add_Click({
+    Write-Log -Level INFO -Message "Clic sur 'Charger et comparer' (OU='$($txtOu.Text.Trim())', Groupe='$($txtGroup.Text.Trim())')"
+
+    if ([string]::IsNullOrWhiteSpace($txtOu.Text.Trim())) {
+        [System.Windows.Forms.MessageBox]::Show("Le champ OU (DN) est obligatoire.", "Champ manquant", "OK", "Warning") | Out-Null
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($txtGroup.Text.Trim())) {
+        [System.Windows.Forms.MessageBox]::Show("Le champ Groupe cible est obligatoire.", "Champ manquant", "OK", "Warning") | Out-Null
+        return
+    }
+
+    $dgv.DataSource = $null
+    $script:dataTable.Rows.Clear()
+    $progressBar.Style = "Marquee"
+    $btnAnalyze.Enabled = $false
+    $form.Refresh()
+    [System.Windows.Forms.Application]::DoEvents()
+
+    try {
+        # 1. Résolution du groupe cible
+        $group = Resolve-TargetGroup -GroupName $txtGroup.Text.Trim()
+        if ($null -eq $group) {
+            [System.Windows.Forms.MessageBox]::Show("Groupe introuvable : '$($txtGroup.Text.Trim())'.`nVérifie le nom exact (SamAccountName).", "Groupe introuvable", "OK", "Error") | Out-Null
+            return
+        }
+        $script:TargetGroupDN   = $group.DistinguishedName
+        $script:TargetGroupName = $group.Name
+        Write-Log -Level INFO -Message "Groupe cible résolu : $($group.Name)"
+
+        # 2. Chargement des utilisateurs de l'OU + comparaison directe
+        $users = @(Get-OuUsersWithMembership -OuDn $txtOu.Text.Trim())
+        $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+        foreach ($u in $users) {
+            $isMember = $u.MemberOf -contains $script:TargetGroupDN
+            $row = $script:dataTable.NewRow()
+            $row["Select"]          = $false
+            $row["SamAccountName"]  = $u.SamAccountName
+            $row["DisplayName"]     = if ($u.DisplayName) { $u.DisplayName } else { $u.Name }
+            $row["Enabled"]         = if ($u.Enabled) { "Oui" } else { "Non" }
+            $row["Statut"]          = if ($isMember) { "Membre" } else { "Non membre" }
+            $row["ActionEffectuee"] = ""
+            $row["DateAnalyse"]     = $now
+            $row["DN"]              = $u.DistinguishedName
+            $script:dataTable.Rows.Add($row)
+        }
+
+        $view = New-Object System.Data.DataView($script:dataTable)
+        $dgv.DataSource = $view
+
+        $membres    = ($script:dataTable.Rows | Where-Object { $_["Statut"] -eq "Membre" }).Count
+        $nonMembres = ($script:dataTable.Rows | Where-Object { $_["Statut"] -eq "Non membre" }).Count
+        Write-Log -Level INFO -Message "Analyse terminée : $($users.Count) compte(s) - $membres membre(s) / $nonMembres non-membre(s)"
+
+        if ($users.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("Aucun utilisateur trouvé dans cette OU.`nVérifie le DN saisi.", "Aucun résultat", "OK", "Information") | Out-Null
+        }
+    }
+    catch {
+        Write-Log -Level ERROR -Message "Échec de l'analyse : $($_.Exception.Message)"
+        [System.Windows.Forms.MessageBox]::Show("Erreur lors de l'analyse :`n`n$($_.Exception.Message)", "Erreur", "OK", "Error") | Out-Null
+    }
+    finally {
+        $progressBar.Style = "Continuous"
+        $btnAnalyze.Enabled = $true
+    }
+})
+
+$btnCheckAll.Add_Click({
+    foreach ($row in $script:dataTable.Rows) { $row["Select"] = $true }
+    $dgv.Refresh()
+})
+$btnUncheckAll.Add_Click({
+    foreach ($row in $script:dataTable.Rows) { $row["Select"] = $false }
+    $dgv.Refresh()
+})
+$btnCheckNonMembers.Add_Click({
+    foreach ($row in $script:dataTable.Rows) {
+        if ($row["Statut"] -eq "Non membre") { $row["Select"] = $true }
+    }
+    $dgv.Refresh()
+})
+
+$btnFix.Add_Click({
+    if ([string]::IsNullOrWhiteSpace($script:TargetGroupDN)) {
+        [System.Windows.Forms.MessageBox]::Show("Lance d'abord une analyse (bouton 'Charger et comparer').", "Aucun groupe résolu", "OK", "Warning") | Out-Null
+        return
+    }
+
+    $toFix = $script:dataTable.Rows | Where-Object { $_["Select"] -eq $true -and $_["Statut"] -eq "Non membre" }
+
+    if ($toFix.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Aucun compte sélectionné et non-membre à corriger.`n(Coche les comptes en rouge, ou utilise 'Cocher les non-membres'.)", "Rien à corriger", "OK", "Information") | Out-Null
+        return
+    }
+
+    $listNames = ($toFix | ForEach-Object { $_["SamAccountName"] }) -join "`n"
+    $modeTxt = if ($chkSimulation.Checked) { "MODE SIMULATION (aucune écriture réelle)" } else { "MODE REEL - ECRITURE DANS L'ANNUAIRE" }
+
+    $confirm = [System.Windows.Forms.MessageBox]::Show(
+        "Ajouter $($toFix.Count) compte(s) au groupe '$script:TargetGroupName' ?`n`n$listNames`n`n$modeTxt",
+        "Confirmation", "YesNo", "Warning"
+    )
+    if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) {
+        Write-Log -Level INFO -Message "Opération FIX annulée par l'utilisateur"
+        return
+    }
+
+    foreach ($row in $toFix) {
+        $ok = Add-AccountToTargetGroup -SamAccountName $row["SamAccountName"]
+        if ($ok) {
+            $row["Statut"]          = if ($chkSimulation.Checked) { "Non membre" } else { "Membre" }
+            $row["ActionEffectuee"] = if ($chkSimulation.Checked) { "Simulé" } else { "Ajouté le $(Get-Date -Format 'yyyy-MM-dd HH:mm')" }
+        }
+        else {
+            $row["ActionEffectuee"] = "Échec"
+        }
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+
+    $dgv.Refresh()
+    Write-Log -Level INFO -Message "Opération FIX terminée sur $($toFix.Count) compte(s)"
+})
+
+$btnExport.Add_Click({ Export-ResultsToCsv -DataTable $script:dataTable })
+
+# ================================================================================================
+# REGION 5 : LANCEMENT
+# ================================================================================================
+Write-Log -Level INFO -Message "=== Démarrage de l'outil d'audit ==="
+Write-Log -Level INFO -Message "Fichier de log : $script:LogFile"
+[void]$form.ShowDialog()
+Write-Log -Level INFO -Message "=== Fermeture de l'outil ==="
